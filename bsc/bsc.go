@@ -2,16 +2,12 @@ package bsc
 
 import (
 	"bytes"
-	"context"
 	"fmt"
 	"io"
 	"math/big"
-	"sort"
 	"sync"
 
-	"github.com/ethereum/go-ethereum/common"
 	ethCommon "github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/consensus/parlia"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethclient"
 	"github.com/ethereum/go-ethereum/rlp"
@@ -30,19 +26,22 @@ import (
 )
 
 const (
-	extraVanity                           = 32          // Fixed number of extra-data prefix bytes reserved for signer vanity
-	extraSeal                             = 65          // Fixed number of extra-data suffix bytes reserved for signer seal
-	defaultEpochLength                    = uint64(200) // Default number of blocks of checkpoint to update validatorSet from contract
-	validatorBytesLength                  = ethCommon.AddressLength
-	validatorBytesLengthAfterLuban        = 68
-	validatorNumberSize                   = 1                  // Fix number of bytes to indicate the number of validators in each epoch
-	ParliaGasLimitBoundDivisor     uint64 = 256                // The bound divisor of the gas limit, used in update calculations.
-	MinGasLimit                    uint64 = 5000               // Minimum the gas limit may ever be.
-	MaxGasLimit                    uint64 = 0x7fffffffffffffff // Maximum the gas limit (2^63-1).
-	attestationBytes = 180
+	extraVanity                     = 32          // Fixed number of extra-data prefix bytes reserved for signer vanity
+	extraSeal                       = 65          // Fixed number of extra-data suffix bytes reserved for signer seal
+	defaultEpochLength              = uint64(200) // Default number of blocks of checkpoint to update validatorSet from contract
+	validatorBytesLengthBeforeLuban = ethCommon.AddressLength
+	BLSPublicKeyLength              = 48
+
+	validatorBytesLength              = 68
+	validatorNumberSize               = 1                  // Fix number of bytes to indicate the number of validators in each epoch
+	ParliaGasLimitBoundDivisor uint64 = 256                // The bound divisor of the gas limit, used in update calculations.
+	MinGasLimit                uint64 = 5000               // Minimum the gas limit may ever be.
+	MaxGasLimit                uint64 = 0x7fffffffffffffff // Maximum the gas limit (2^63-1).
+	attestationBytes                  = 180
 )
 
 var (
+	lubanBlockTestnet                 = big.NewInt(29295050)
 	big1      = big.NewInt(1)
 	uncleHash = types.CalcUncleHash(nil)
 )
@@ -101,10 +100,9 @@ type Verifier struct {
 	parentHash                 ethCommon.Hash
 	validators                 map[ethCommon.Address]bool
 	prevValidators             map[ethCommon.Address]bool
-	validatorPubKey map[ethCommon.Address]types.BLSPublicKey
-	prevValidatorPubKey map[ethCommon.Address]types.BLSPublicKey 
+	validatorPubKey            map[ethCommon.Address]types.BLSPublicKey
+	prevValidatorPubKey        map[ethCommon.Address]types.BLSPublicKey
 	useNewValidatorsFromHeight *big.Int
-	ethClient                  *ethclient.Client
 	ParentHeader               []*types.Header
 }
 
@@ -116,24 +114,34 @@ type IVerifier interface {
 	IsValidator(addr ethCommon.Address, curHeight *big.Int) bool
 }
 
-func NewVerifier(number, chainID, useNewValidatorsFromHeight *big.Int, parentHash ethCommon.Hash, extra []byte, ethClient *ethclient.Client, prevHeader *types.Header) *Verifier {
-	validators, validatorPubKey, err := getValidatorMapFromHex(extra)
+func NewVerifier(number, chainID, useNewValidatorsFromHeight *big.Int, parentHash ethCommon.Hash, validatorHeader *types.Header, ethClient *ethclient.Client, prevHeader *types.Header) *Verifier {
+	validators, validatorPubKey, err := parseValidators(validatorHeader)
+	fmt.Println(validators, validatorPubKey)
+
 	if err != nil {
 		return nil
 	}
 	parentHeaderList := make([]*types.Header, 1)
 	parentHeaderList = append(parentHeaderList, prevHeader)
+	valAddressMap := make(map[ethCommon.Address]bool)
+	valPublicKey := make(map[ethCommon.Address]types.BLSPublicKey)
+	for i := 0; i < len(validators); i++ {
+		valAddressMap[validators[i]] = true
+		if isLubanBlock(validatorHeader.Number) {
+			valPublicKey[validators[i]] = validatorPubKey[i]
+		}
+	}
+
 	return &Verifier{
 		mu:                         sync.RWMutex{},
 		next:                       number,
 		parentHash:                 parentHash,
 		chainID:                    chainID,
 		useNewValidatorsFromHeight: useNewValidatorsFromHeight,
-		prevValidators:             validators,
-		validators:                 validators,
-		prevValidatorPubKey: validatorPubKey,
-		validatorPubKey: validatorPubKey,
-		ethClient:                  ethClient,
+		prevValidators:             valAddressMap,
+		validators:                 valAddressMap,
+		prevValidatorPubKey:        valPublicKey,
+		validatorPubKey:            valPublicKey,
 		ParentHeader:               parentHeaderList,
 	}
 }
@@ -218,16 +226,26 @@ func (vr *Verifier) Update(previousHeader, header *types.Header) (err error) {
 	defer vr.mu.Unlock()
 	fmt.Println("updating for block : ", header.Number)
 	fmt.Println("updating parent header: ", previousHeader.Number)
-	if header.Number.Uint64()%defaultEpochLength == 0 {
-		newValidators, validatorPubKey, err := getValidatorMapFromHex(header.Extra)
+	valAddressMap := make(map[ethCommon.Address]bool)
+	valPublicKeyMap := make(map[ethCommon.Address]types.BLSPublicKey)
+
+	if header.Number.Uint64()%defaultEpochLength == 0 || isLubanBlock(header.Number){
+		newValidators, blsPubKeys, err := parseValidators(header)
+		for i := 0; i < len(newValidators); i++ {
+			valAddressMap[newValidators[i]] = true
+			if isLubanBlock(header.Number){
+				valPublicKeyMap[newValidators[i]] = blsPubKeys[i]
+			}
+
+		}
 		if err != nil {
 			return errors.Wrapf(err, "getValidatorMapFromHex %v", err)
 		}
 		// update validators only if epoch block and no error encountered
 		vr.prevValidators = vr.validators
-		vr.validators = newValidators
+		vr.validators = valAddressMap
 		vr.prevValidatorPubKey = vr.validatorPubKey
-		vr.validatorPubKey = validatorPubKey
+		vr.validatorPubKey = valPublicKeyMap
 		vr.useNewValidatorsFromHeight = (&big.Int{}).Add(header.Number, big.NewInt(1+int64(len(vr.prevValidators)/2)))
 	}
 	vr.parentHash = header.Hash()
@@ -238,58 +256,59 @@ func (vr *Verifier) Update(previousHeader, header *types.Header) (err error) {
 	return
 }
 
-
-func getValidatorMapFromHex(headerExtra HexBytes) (map[ethCommon.Address]bool, map[ethCommon.Address]types.BLSPublicKey, error) {
-	fmt.Println("validator map get for header number: ")
-
-	fmt.Println("of first header: ", len(headerExtra) - extraSeal- extraVanity- 180 - 1)
-	if len(headerExtra) < extraVanity+extraSeal {
-		return nil,nil, errMissingSignature
-	}
-
-	num := int(headerExtra[32])
-	fmt.Println("num is : ", num)
-
-	start := extraVanity + 1
-	end := start + num*68
-
-	validatorBytes := headerExtra[start:end]
-	addr, blsPublicKey, err := parseValidators(validatorBytes)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	addressMap := make(map[ethCommon.Address]bool)
-
-	validatorPublicKey := make(map[ethCommon.Address]types.BLSPublicKey)
-
-	for i, ad := range addr {
-		fmt.Println(ad)
-		addressMap[ad] = true
-		validatorPublicKey[ad] = blsPublicKey[i]
-	}
-
-	return addressMap, validatorPublicKey, nil
-
-}
-
-func parseValidators(validatorsBytes []byte) ([]ethCommon.Address, []types.BLSPublicKey, error) {
+func parseValidators(header *types.Header) ([]ethCommon.Address, []types.BLSPublicKey, error) {
+	validatorsBytes := getValidatorBytesFromHeader(header)
+	fmt.Println("lenght of validators bytes is: ", len(validatorsBytes), header.Number)
 	if len(validatorsBytes) == 0 {
 		return nil, nil, errors.New("invalid validators bytes")
 	}
 
-	n := len(validatorsBytes) / validatorBytesLengthAfterLuban
-	fmt.Println("validators byte ", n)
+	if !isLubanBlock(header.Number) {
+		n := len(validatorsBytes) / validatorBytesLengthBeforeLuban
+		result := make([]ethCommon.Address, n)
+		for i := 0; i < n; i++ {
+			result[i] = ethCommon.BytesToAddress(validatorsBytes[i*validatorBytesLengthBeforeLuban : (i+1)*validatorBytesLengthBeforeLuban])
+		}
+		return result, nil, nil
+	}
+
+	n := len(validatorsBytes) / validatorBytesLength
 	cnsAddrs := make([]ethCommon.Address, n)
 	voteAddrs := make([]types.BLSPublicKey, n)
 	for i := 0; i < n; i++ {
-		cnsAddrs[i] = ethCommon.BytesToAddress(validatorsBytes[i*validatorBytesLengthAfterLuban : i*validatorBytesLengthAfterLuban+ethCommon.AddressLength])
-		copy(voteAddrs[i][:], validatorsBytes[i*validatorBytesLengthAfterLuban+ethCommon.AddressLength:(i+1)*validatorBytesLengthAfterLuban])
+		cnsAddrs[i] = ethCommon.BytesToAddress(validatorsBytes[i*validatorBytesLength : i*validatorBytesLength+ethCommon.AddressLength])
+		copy(voteAddrs[i][:], validatorsBytes[i*validatorBytesLength+ethCommon.AddressLength:(i+1)*validatorBytesLength])
+	}
+	return cnsAddrs, voteAddrs, nil
+}
+
+func getValidatorBytesFromHeader(header *types.Header) []byte {
+	fmt.Println("reaached in the top: ", len(header.Extra), extraVanity+extraSeal)
+	if len(header.Extra) <= extraVanity+extraSeal {
+			return nil
 	}
 
-	fmt.Println(cnsAddrs)
-	fmt.Println(voteAddrs)
-	return cnsAddrs, voteAddrs, nil
+	if !isLubanBlock(header.Number) {
+		if header.Number.Uint64()%defaultEpochLength == 0 && (len(header.Extra)-extraSeal-extraVanity)%validatorBytesLengthBeforeLuban != 0 {
+			return nil
+		}
+		return header.Extra[extraVanity : len(header.Extra)-extraSeal]
+	}
+
+	if header.Number.Uint64()%defaultEpochLength != 0 {
+		fmt.Println("reaches here: ", isExLuban(header.Number))
+		if !isExLuban(header.Number){
+			fmt.Println("shoudlnot come here")
+			return nil
+		}
+	}
+	num := int(header.Extra[extraVanity])
+	if num == 0 || len(header.Extra) <= extraVanity+extraSeal+num*validatorBytesLength {
+		return nil
+	}
+	start := extraVanity + validatorNumberSize
+	end := start + num*validatorBytesLength
+	return header.Extra[start:end]
 }
 
 func (vr *Verifier) verifyHeader(header *types.Header) error {
@@ -311,7 +330,7 @@ func (vr *Verifier) verifyHeader(header *types.Header) error {
 	}
 
 	// check extra data
-	isEpoch := number%defaultEpochLength == 0
+	// isEpoch := number%defaultEpochLength == 0
 
 	fmt.Println("the number is ", number)
 
@@ -319,21 +338,22 @@ func (vr *Verifier) verifyHeader(header *types.Header) error {
 	signersBytes := len(header.Extra) - extraVanity - extraSeal
 	fmt.Println("signers bytes of header ", header.Number, "is", signersBytes)
 
-	// now the blocks contains attestaion feilds 
-	if !isEpoch && signersBytes > attestationBytes {
-		return errExtraValidators
-	}
+	// now the blocks contains attestaion feilds
 
-	if isEpoch && signersBytes == 0 {
-		return errMissingValidators
-	}
+	// if !isEpoch && signersBytes > attestationBytes {
+	// 	return errExtraValidators
+	// }
 
-	validatorsBytes := signersBytes - validatorNumberSize - attestationBytes
-	fmt.Println("signers bytes of header ", header.Number, "is", validatorsBytes)
+	// if isEpoch && signersBytes == 0 {
+	// 	return errMissingValidators
+	// }
 
-	if isEpoch && validatorsBytes%validatorBytesLengthAfterLuban != 0 {
-		return errInvalidSpanValidators
-	}
+	// validatorsBytes := signersBytes - validatorNumberSize - attestationBytes
+	// fmt.Println("signers bytes of header ", header.Number, "is", validatorsBytes)
+
+	// if isEpoch && validatorsBytes%validatorBytesLength != 0 {
+	// 	return errInvalidSpanValidators
+	// }
 
 	// Ensure that the mix digest is zero as we don't have fork protection currently
 	if header.MixDigest != (ethCommon.Hash{}) {
@@ -473,11 +493,11 @@ func (vr Verifier) VerifyVoteAttestation(header *types.Header, parents []*types.
 
 	fmt.Println("reached in verify vote attestation ")
 
-	// we send the parent to be verified along with the next block 
+	// we send the parent to be verified along with the next block
 	// we gather the attestation data of the next block and compare it to the parents
-	// we then get the bls signatures from the next header 
+	// we then get the bls signatures from the next header
 	// we then verifiy the bls signatures with the validator set that was updated in the beginning of the cycle
-	
+
 	attestation, err := parseVoteAttestation(header)
 
 	// _, blsSignatures, err := getValidatorMapFromHex(header.Extra)
@@ -486,6 +506,7 @@ func (vr Verifier) VerifyVoteAttestation(header *types.Header, parents []*types.
 		return err
 	}
 	if attestation == nil {
+		fmt.Println("not luban block reaches here: ", attestation)
 		return nil
 	}
 	if attestation.Data == nil {
@@ -524,16 +545,14 @@ func (vr Verifier) VerifyVoteAttestation(header *types.Header, parents []*types.
 	// The source block should be the highest justified block.
 
 	// n-1, n, n + 1 blocks xa. n + 1 block ko target block is n because it is the block whose votes are contained in n + 1
-	// nth block ko target block will be n - 1 because same reason 
+	// nth block ko target block will be n - 1 because same reason
 	// n + 1 ko source number will be n - 1 because n - 1 is the highest justified block when n + 1 came out i.e.
-	// according to the docs justified blocks are the blocks which is a root or the vote data of the block lies in the child below it. 
-	// when n + 1 block comes out, the highest justified block will be n - 1 because n - 1's vote data is present in the n th block which n + 1 votes for. 
-	
-	
+	// according to the docs justified blocks are the blocks which is a root or the vote data of the block lies in the child below it.
+	// when n + 1 block comes out, the highest justified block will be n - 1 because n - 1's vote data is present in the n th block which n + 1 votes for.
+
 	sourceNumber := attestation.Data.SourceNumber
 	sourceHash := attestation.Data.SourceHash
 
-	
 	fmt.Println(sourceNumber)
 	fmt.Println(sourceHash)
 	fmt.Println(attestation.Data.TargetNumber)
@@ -543,7 +562,7 @@ func (vr Verifier) VerifyVoteAttestation(header *types.Header, parents []*types.
 	fmt.Println("header of parent: ", parent.Number)
 
 	// get justified number nad hash le parent header ma bhako attenstaion le kun block lai vote garna lako ho tyesko informantion dinxa
-	// since parent le vote gareko 
+	// since parent le vote gareko
 	justifiedBlockNumber, justifiedBlockHash, err := vr.GetJustifiedNumberAndHash(parent)
 
 	fmt.Println("comparing the justified number and hash ")
@@ -572,17 +591,16 @@ func (vr Verifier) VerifyVoteAttestation(header *types.Header, parents []*types.
 	// Filter out valid validator from attestation.
 	var validators []ethCommon.Address
 
-	for validator, _ := range(vr.validators){
+	for validator, _ := range vr.validators {
 		// fmt.Println(validator)
 		// fmt.Println(vr.validatorPubKey[validator])
 		validators = append(validators, validator)
 	}
 
 	// header ko attestation data bata validator bit set nikalyo
-	
+
 	validatorsBitSet := bitset.From([]uint64{uint64(attestation.VoteAddressSet)})
 
-	
 	if validatorsBitSet.Count() > uint(len(validators)) {
 		return fmt.Errorf("invalid attestation, vote number larger than validators number")
 	}
@@ -636,10 +654,10 @@ func parseVoteAttestation(header *types.Header) (*types.VoteAttestation, error) 
 		attestationBytes = header.Extra[extraVanity : len(header.Extra)-extraSeal]
 	} else {
 		num := int(header.Extra[extraVanity])
-		if len(header.Extra) <= extraVanity+extraSeal+validatorNumberSize+num*validatorBytesLengthAfterLuban {
+		if len(header.Extra) <= extraVanity+extraSeal+validatorNumberSize+num*validatorBytesLength {
 			return nil, nil
 		}
-		start := extraVanity + validatorNumberSize + num*validatorBytesLengthAfterLuban
+		start := extraVanity + validatorNumberSize + num*validatorBytesLength
 		end := len(header.Extra) - extraSeal
 		attestationBytes = header.Extra[start:end]
 	}
@@ -677,140 +695,10 @@ func (vr *Verifier) GetJustifiedNumberAndHash(header *types.Header) (uint64, eth
 	}
 
 	fmt.Println(voteAttestaionOfParent.Data.SourceNumber)
-	
+
 	fmt.Println(voteAttestaionOfParent.Data.SourceHash)
-	
+
 	return voteAttestaionOfParent.Data.TargetNumber, voteAttestaionOfParent.Data.TargetHash, nil
-}
-
-func (vr *Verifier) parliaSnapshot(number uint64, hash common.Hash, parents []*types.Header) (*parlia.Snapshot, error) {
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	var (
-		headers []*types.Header
-		snap    *parlia.Snapshot
-	)
-
-	var err error
-
-	for snap == nil {
-		fmt.Println("reached inside for in parlia snapshot")
-		fmt.Println(number)
-		if number == 0 || number%defaultEpochLength == 0 {
-			fmt.Println("should reach in first if ")
-			checkpoint, err := vr.ethClient.HeaderByNumber(ctx, big.NewInt(int64(number)))
-			fmt.Println(checkpoint)
-			if err != nil {
-				return nil, err
-			}
-			if checkpoint != nil {
-				fmt.Println("reached inside checkpoint")
-				hash := checkpoint.Hash()
-				validatorsBytes := getValidatorsBytesFromHeader(checkpoint.Extra)
-
-				validators, voteAddrs, err := parseValidators(validatorsBytes)
-				fmt.Println(validators)
-				if err != nil {
-					return nil, err
-				}
-				snap = snapshot(number, hash, validators, voteAddrs)
-				attestation, err := parseVoteAttestation(checkpoint)
-				if err != nil {
-					fmt.Println("error from here??")
-					return nil, err
-				}
-				targetNumber := attestation.Data.TargetNumber
-				targetHash := attestation.Data.TargetHash
-				snap.Attestation = &types.VoteData{
-					SourceNumber: attestation.Data.SourceNumber,
-					SourceHash:   attestation.Data.SourceHash,
-					TargetNumber: targetNumber,
-					TargetHash:   targetHash,
-				}
-
-				break
-
-			}
-		}
-
-		var header *types.Header
-		if len(parents) > 0 {
-			fmt.Println("sent parents")
-			// If we have explicit parents, pick from there (enforced)
-			header = parents[len(parents)-1]
-			if header.Hash() != hash || header.Number.Uint64() != number {
-				return nil, consensus.ErrUnknownAncestor
-			}
-			parents = parents[:len(parents)-1]
-		} else {
-			fmt.Println("reaching to eth client to get the parents until the previous epoch")
-			// No explicit parents (or no more left), reach out to the database
-			header, err = vr.ethClient.HeaderByNumber(ctx, big.NewInt(int64(number)))
-			fmt.Println(header)
-			fmt.Println("header.parent hash", header.ParentHash)
-			if err != nil {
-				return nil, err
-			}
-			if header == nil {
-				return nil, consensus.ErrUnknownAncestor
-			}
-		}
-		fmt.Println("before appending: ", header)
-		headers = append(headers, header)
-		number, hash = number-1, header.ParentHash
-	}
-	if snap == nil {
-		return nil, fmt.Errorf("error in retriving snapshot for block %v", number)
-	}
-
-	return snap, nil
-}
-
-func snapshot(number uint64, hash common.Hash, validators []common.Address, voteAddrs []types.BLSPublicKey) *parlia.Snapshot {
-	snap := &parlia.Snapshot{
-		Number:           number,
-		Hash:             hash,
-		Recents:          make(map[uint64]common.Address),
-		RecentForkHashes: make(map[uint64]string),
-		Validators:       make(map[common.Address]*parlia.ValidatorInfo),
-	}
-
-	for idx, v := range validators {
-		// The luban fork from the genesis block
-		if len(voteAddrs) == len(validators) {
-			snap.Validators[v] = &parlia.ValidatorInfo{
-				VoteAddress: voteAddrs[idx],
-			}
-		} else {
-			snap.Validators[v] = &parlia.ValidatorInfo{}
-		}
-	}
-
-	// The luban fork from the genesis block
-	if len(voteAddrs) == len(validators) {
-		validators := validatorsList(snap.Validators)
-		for idx, v := range validators {
-			snap.Validators[v].Index = idx + 1 // offset by 1
-		}
-	}
-
-	return snap
-}
-
-type validatorsAscending []common.Address
-
-func (s validatorsAscending) Len() int           { return len(s) }
-func (s validatorsAscending) Less(i, j int) bool { return bytes.Compare(s[i][:], s[j][:]) < 0 }
-func (s validatorsAscending) Swap(i, j int)      { s[i], s[j] = s[j], s[i] }
-
-func validatorsList(Validators map[common.Address]*parlia.ValidatorInfo) []common.Address {
-	validators := make([]common.Address, 0, len(Validators))
-	for v := range Validators {
-		validators = append(validators, v)
-	}
-	sort.Sort(validatorsAscending(validators))
-	return validators
 }
 
 func getValidatorsBytesFromHeader(extra []byte) []byte {
@@ -822,4 +710,12 @@ func getValidatorsBytesFromHeader(extra []byte) []byte {
 		return extra[start:end]
 	}
 	return nil
+}
+
+func isLubanBlock(block *big.Int) bool {
+	return block.Cmp(lubanBlockTestnet) > 0
+}
+
+func isExLuban(block *big.Int) bool {
+	return block.Cmp(lubanBlockTestnet)==0
 }

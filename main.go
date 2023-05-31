@@ -34,7 +34,7 @@ func main() {
 
 	chainid, err := ethcl.ChainID(ctx)
 	// 29295050
-	blockNumber := 29649200
+	blockNumber := 29295000
 	fmt.Println(blockNumber)
 
 	validatorHeight := big.NewInt(int64(blockNumber + 200))
@@ -50,7 +50,7 @@ func main() {
 	validatorHeader, err := ethcl.HeaderByNumber(ctx, big.NewInt(int64(blockNumber - 200)))
 	fmt.Println(len(previousHeader.Extra))
 
-	verifier := bsc.NewVerifier(big.NewInt(int64(blockNumber)), chainid, validatorHeight, previousHeader.ParentHash, validatorHeader.Extra, ethcl, previousToPrevHeader)
+	verifier := bsc.NewVerifier(big.NewInt(int64(blockNumber)), chainid, validatorHeight, previousHeader.ParentHash, validatorHeader, ethcl, previousToPrevHeader)
 	fmt.Println(verifier)
 
 	// previousHeader, err = ethcl.HeaderByNumber(ctx, big.NewInt(int64(blockNumber)))
